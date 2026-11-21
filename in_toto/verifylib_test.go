@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -14,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/secure-systems-lab/go-securesystemslib/dsse"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -744,20 +747,20 @@ func TestReduceStepsMetadata(t *testing.T) {
 	// - Different products (name)
 	stepsMetadataList := []map[string]map[string]Metadata{
 		{"foo": {
-			"a": &Metablock{Signed: Link{Materials: map[string]HashObj{"foo.py": {"sha265": "abc"}}}},
-			"b": &Metablock{Signed: Link{Materials: map[string]HashObj{"foo.py": {"sha265": "def"}}}},
+			"a": &Metablock{Signed: Link{Type: "link", Name: "foo", Materials: map[string]HashObj{"foo.py": {"sha265": "abc"}}}},
+			"b": &Metablock{Signed: Link{Type: "link", Name: "foo", Materials: map[string]HashObj{"foo.py": {"sha265": "def"}}}},
 		}},
 		{"foo": {
-			"a": &Metablock{Signed: Link{Materials: map[string]HashObj{"foo.py": {"sha265": "abc"}}}},
-			"b": &Metablock{Signed: Link{Materials: map[string]HashObj{"bar.py": {"sha265": "abc"}}}},
+			"a": &Metablock{Signed: Link{Type: "link", Name: "foo", Materials: map[string]HashObj{"foo.py": {"sha265": "abc"}}}},
+			"b": &Metablock{Signed: Link{Type: "link", Name: "foo", Materials: map[string]HashObj{"bar.py": {"sha265": "abc"}}}},
 		}},
 		{"foo": {
-			"a": &Metablock{Signed: Link{Products: map[string]HashObj{"foo.py": {"sha265": "abc"}}}},
-			"b": &Metablock{Signed: Link{Products: map[string]HashObj{"foo.py": {"sha265": "def"}}}},
+			"a": &Metablock{Signed: Link{Type: "link", Name: "foo", Products: map[string]HashObj{"foo.py": {"sha265": "abc"}}}},
+			"b": &Metablock{Signed: Link{Type: "link", Name: "foo", Products: map[string]HashObj{"foo.py": {"sha265": "def"}}}},
 		}},
 		{"foo": {
-			"a": &Metablock{Signed: Link{Products: map[string]HashObj{"foo.py": {"sha265": "abc"}}}},
-			"b": &Metablock{Signed: Link{Products: map[string]HashObj{"bar.py": {"sha265": "abc"}}}},
+			"a": &Metablock{Signed: Link{Type: "link", Name: "foo", Products: map[string]HashObj{"foo.py": {"sha265": "abc"}}}},
+			"b": &Metablock{Signed: Link{Type: "link", Name: "foo", Products: map[string]HashObj{"bar.py": {"sha265": "abc"}}}},
 		}},
 	}
 
@@ -1156,4 +1159,416 @@ func TestLoadLayoutCertificates(t *testing.T) {
 	testLayout.IntermediateCas[intermediateKey.KeyID] = intermediateKey
 	_, _, err = LoadLayoutCertificates(testLayout, [][]byte{[]byte("123123123")})
 	assert.NotNil(t, err, "expected error with invalid extra intermediates")
+}
+
+// signedTestLink is a test helper that creates a link metadata file for the
+// given step name, signed with key, inside linkDir. It returns the loaded
+// metadata and the path the link was written to.
+func signedTestLink(t *testing.T, linkDir, name string, key Key, useDSSE bool) (Metadata, string) {
+	t.Helper()
+	linkEnv, err := InTotoRun(name, linkDir, nil, nil, nil, key,
+		[]string{"sha256"}, nil, nil, testOSisWindows(), false, useDSSE)
+	if err != nil {
+		t.Fatalf("failed to create signed link for step '%s': %s", name, err)
+	}
+	linkPath := filepath.Join(linkDir, fmt.Sprintf(LinkNameFormat, name, key.KeyID))
+	if err := linkEnv.Dump(linkPath); err != nil {
+		t.Fatalf("failed to dump link '%s': %s", linkPath, err)
+	}
+	return linkEnv, linkPath
+}
+
+// rebindLinkFile rewrites the signed payload of an existing link file,
+// replacing the step name and re-signing it with the passed key. This models
+// a functionary re-binding a validly signed payload to a different step.
+func rebindLinkFile(t *testing.T, linkPath string, key Key, newName string) {
+	t.Helper()
+	linkBytes, err := os.ReadFile(linkPath)
+	if err != nil {
+		t.Fatalf("failed to read link '%s': %s", linkPath, err)
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(linkBytes, &raw); err != nil {
+		t.Fatalf("failed to parse link '%s': %s", linkPath, err)
+	}
+
+	if _, isEnvelope := raw["payload"]; isEnvelope {
+		env := &dsse.Envelope{}
+		if err := json.Unmarshal(linkBytes, env); err != nil {
+			t.Fatalf("failed to parse envelope '%s': %s", linkPath, err)
+		}
+		payloadBytes, err := env.DecodeB64Payload()
+		if err != nil {
+			t.Fatalf("failed to decode envelope payload: %s", err)
+		}
+		var link Link
+		if err := json.Unmarshal(payloadBytes, &link); err != nil {
+			t.Fatalf("failed to decode link payload: %s", err)
+		}
+		link.Name = newName
+		wrapped := &Envelope{}
+		if err := wrapped.SetPayload(link); err != nil {
+			t.Fatalf("failed to re-encode payload: %s", err)
+		}
+		if err := wrapped.Sign(key); err != nil {
+			t.Fatalf("failed to re-sign payload: %s", err)
+		}
+		if err := wrapped.Dump(linkPath); err != nil {
+			t.Fatalf("failed to dump rebound link: %s", err)
+		}
+		return
+	}
+
+	mb, err := LoadMetadata(linkPath)
+	if err != nil {
+		t.Fatalf("failed to load metablock '%s': %s", linkPath, err)
+	}
+	metablock, ok := mb.(*Metablock)
+	if !ok {
+		t.Fatalf("metadata in '%s' is not a metablock", linkPath)
+	}
+	link, ok := metablock.Signed.(Link)
+	if !ok {
+		t.Fatalf("metadata in '%s' is not a link", linkPath)
+	}
+	link.Name = newName
+	metablock.Signed = link
+	metablock.Signatures = nil
+	if err := metablock.Sign(key); err != nil {
+		t.Fatalf("failed to re-sign payload: %s", err)
+	}
+	if err := metablock.Dump(linkPath); err != nil {
+		t.Fatalf("failed to dump rebound link: %s", err)
+	}
+}
+
+// writeUnsignedNamedLink writes an (invalidly signed) link metadata file whose
+// payload has an empty step name, simulating a link that cannot be bound to
+// any layout step.
+func writeUnnamedLinkFile(t *testing.T, linkDir, fileName string, key Key) {
+	t.Helper()
+	link := Link{
+		Type:        "link",
+		Name:        "",
+		Materials:   map[string]HashObj{},
+		Products:    map[string]HashObj{},
+		ByProducts:  map[string]interface{}{},
+		Command:     []string{},
+		Environment: map[string]interface{}{},
+	}
+	mb := &Metablock{Signed: link, Signatures: []Signature{}}
+	if err := mb.Sign(key); err != nil {
+		t.Fatalf("failed to sign unnamed link: %s", err)
+	}
+	if err := mb.Dump(filepath.Join(linkDir, fileName)); err != nil {
+		t.Fatalf("failed to dump unnamed link: %s", err)
+	}
+}
+
+// TestLoadLinksForLayoutStepBinding verifies that link loading firmly binds
+// the signed payload to the layout step and rejects:
+//   - links whose signed step name does not match the layout step,
+//     including cross-step replays and re-bound payloads,
+//   - links without a step name,
+//   - alias collisions where two link files for one step carry the same
+//     signer key,
+//
+// while normal, correctly named links continue to load as before.
+func TestLoadLinksForLayoutStepBinding(t *testing.T) {
+	var carol Key
+	if err := carol.LoadKey("carol", "ed25519", []string{"sha256", "sha512"}); err != nil {
+		t.Fatalf("unable to load Carol's key: %s", err)
+	}
+
+	twoStepLayout := func() Layout {
+		return Layout{
+			Type:    "layout",
+			Expires: "2099-01-01T00:00:00Z",
+			Keys:    map[string]Key{carol.KeyID: carol},
+			Steps: []Step{
+				{
+					Type:      "step",
+					Threshold: 1,
+					PubKeys:   []string{carol.KeyID},
+					SupplyChainItem: SupplyChainItem{
+						Name:              "foo",
+						ExpectedMaterials: [][]string{{"DISALLOW", "*"}},
+						ExpectedProducts:  [][]string{{"ALLOW", "*"}},
+					},
+				},
+				{
+					Type:      "step",
+					Threshold: 1,
+					PubKeys:   []string{carol.KeyID},
+					SupplyChainItem: SupplyChainItem{
+						Name:              "bar",
+						ExpectedMaterials: [][]string{{"DISALLOW", "*"}},
+						ExpectedProducts:  [][]string{{"ALLOW", "*"}},
+					},
+				},
+			},
+		}
+	}
+
+	for _, useDSSE := range []bool{false, true} {
+		name := "metablock"
+		if useDSSE {
+			name = "dsse"
+		}
+		t.Run(name, func(t *testing.T) {
+			layout := twoStepLayout()
+
+			// Baseline: correctly named links for both steps load fine.
+			goodDir := t.TempDir()
+			signedTestLink(t, goodDir, "foo", carol, useDSSE)
+			signedTestLink(t, goodDir, "bar", carol, useDSSE)
+
+			loaded, err := LoadLinksForLayout(layout, goodDir)
+			if err != nil {
+				t.Fatalf("LoadLinksForLayout rejected valid links: %s", err)
+			}
+			if len(loaded["foo"]) != 1 || len(loaded["bar"]) != 1 {
+				t.Fatalf("expected one link per step, got %v", loaded)
+			}
+
+			// Cross-step replay: bar's validly signed link is placed into a
+			// separate directory under a foo link file name that matches
+			// foo's glob and the signer's short key id. The payload still
+			// names bar so loading it for foo must be rejected.
+			replayDir := t.TempDir()
+			_, barLinkPath := signedTestLink(t, replayDir, "bar", carol, useDSSE)
+			barBytes, err := os.ReadFile(barLinkPath)
+			if err != nil {
+				t.Fatalf("failed to read bar link: %s", err)
+			}
+			replayPath := filepath.Join(replayDir,
+				fmt.Sprintf(LinkNameFormat, "foo", carol.KeyID))
+			if err := os.WriteFile(replayPath, barBytes, 0644); err != nil {
+				t.Fatalf("failed to write replay link: %s", err)
+			}
+			// A valid bar link still has to exist so the loader reaches the
+			// foo step rather than failing on bar's threshold first.
+			signedTestLink(t, replayDir, "bar", carol, useDSSE)
+			_, err = LoadLinksForLayout(layout, replayDir)
+			if err == nil || !errors.Is(err, ErrLinkStepMismatch) {
+				t.Fatalf("expected ErrLinkStepMismatch for cross-step replay, got: %v", err)
+			}
+
+			// Payload re-binding with a fresh signature: a foo link whose
+			// payload was changed to claim bar and re-signed by the same
+			// functionary must be rejected. This models an attacker who
+			// controls the functionary key and tries to re-bind a validly
+			// signed payload to a different step.
+			rebindSignedDir := t.TempDir()
+			_, fooPath := signedTestLink(t, rebindSignedDir, "foo", carol, useDSSE)
+			rebindLinkFile(t, fooPath, carol, "bar")
+			_, err = LoadLinksForLayout(layout, rebindSignedDir)
+			if err == nil || !errors.Is(err, ErrLinkStepMismatch) {
+				t.Fatalf("expected ErrLinkStepMismatch for re-bound payload, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestLoadLinksForLayoutMissingStepName verifies that link files whose signed
+// payload carries no step name are refused.
+func TestLoadLinksForLayoutMissingStepName(t *testing.T) {
+	var carol Key
+	if err := carol.LoadKey("carol", "ed25519", []string{"sha256", "sha512"}); err != nil {
+		t.Fatalf("unable to load Carol's key: %s", err)
+	}
+
+	layout := Layout{
+		Type:    "layout",
+		Expires: "2099-01-01T00:00:00Z",
+		Keys:    map[string]Key{carol.KeyID: carol},
+		Steps: []Step{{
+			Type:      "step",
+			Threshold: 1,
+			PubKeys:   []string{carol.KeyID},
+			SupplyChainItem: SupplyChainItem{
+				Name:              "foo",
+				ExpectedMaterials: [][]string{{"DISALLOW", "*"}},
+				ExpectedProducts:  [][]string{{"ALLOW", "*"}},
+			},
+		}},
+	}
+
+	linkDir := t.TempDir()
+	writeUnnamedLinkFile(t, linkDir,
+		fmt.Sprintf(LinkNameFormat, "foo", carol.KeyID), carol)
+
+	_, err := LoadLinksForLayout(layout, linkDir)
+	if err == nil || !errors.Is(err, ErrLinkStepMismatch) {
+		t.Fatalf("expected ErrLinkStepMismatch for unnamed link, got: %v", err)
+	}
+	if !errors.Is(err, ErrLinkNameEmpty) {
+		t.Fatalf("expected ErrLinkNameEmpty to be wrapped, got: %v", err)
+	}
+}
+
+// TestLoadLinksForLayoutDuplicateSigner verifies that two link files for the
+// same step with signatures from the same functionary key (an alias
+// collision) are refused instead of silently overwriting one another.
+func TestLoadLinksForLayoutDuplicateSigner(t *testing.T) {
+	var carol Key
+	if err := carol.LoadKey("carol", "ed25519", []string{"sha256", "sha512"}); err != nil {
+		t.Fatalf("unable to load Carol's key: %s", err)
+	}
+
+	layout := Layout{
+		Type:    "layout",
+		Expires: "2099-01-01T00:00:00Z",
+		Keys:    map[string]Key{carol.KeyID: carol},
+		Steps: []Step{{
+			Type:      "step",
+			Threshold: 1,
+			PubKeys:   []string{carol.KeyID},
+			SupplyChainItem: SupplyChainItem{
+				Name:              "foo",
+				ExpectedMaterials: [][]string{{"DISALLOW", "*"}},
+				ExpectedProducts:  [][]string{{"ALLOW", "*"}},
+			},
+		}},
+	}
+
+	linkDir := t.TempDir()
+	linkEnv, linkPath := signedTestLink(t, linkDir, "foo", carol, false)
+
+	// Add a second signature from the same functionary key to the same link
+	// file. Without collision detection the duplicate signer would be
+	// silently deduplicated and distort threshold accounting.
+	mb, ok := linkEnv.(*Metablock)
+	if !ok {
+		t.Fatalf("expected Metablock, got %T", linkEnv)
+	}
+	if err := mb.Sign(carol); err != nil {
+		t.Fatalf("failed to add duplicate signature: %s", err)
+	}
+	if err := mb.Dump(linkPath); err != nil {
+		t.Fatalf("failed to dump double-signed link: %s", err)
+	}
+
+	_, err := LoadLinksForLayout(layout, linkDir)
+	if err == nil || !errors.Is(err, ErrDuplicateLinkSigner) {
+		t.Fatalf("expected ErrDuplicateLinkSigner, got: %v", err)
+	}
+
+	// A normally, single-signed link keeps working under the original
+	// contract once the duplicate is removed.
+	goodDir := t.TempDir()
+	signedTestLink(t, goodDir, "foo", carol, false)
+	loaded, err := LoadLinksForLayout(layout, goodDir)
+	if err != nil {
+		t.Fatalf("valid single link was rejected: %s", err)
+	}
+	if len(loaded["foo"]) != 1 {
+		t.Fatalf("expected one foo link, got %v", loaded)
+	}
+}
+
+// TestVerifyLinkSignatureThresholdsStepBinding verifies that signature
+// threshold verification rejects links whose payload name does not match the
+// layout step, even when they were injected through the metadata map rather
+// than loaded from disk.
+func TestVerifyLinkSignatureThresholdsStepBinding(t *testing.T) {
+	var carol Key
+	if err := carol.LoadKey("carol", "ed25519", []string{"sha256", "sha512"}); err != nil {
+		t.Fatalf("unable to load Carol's key: %s", err)
+	}
+
+	layout := Layout{
+		Type:    "layout",
+		Expires: "2099-01-01T00:00:00Z",
+		Keys:    map[string]Key{carol.KeyID: carol},
+		Steps: []Step{{
+			Type:      "step",
+			Threshold: 1,
+			PubKeys:   []string{carol.KeyID},
+			SupplyChainItem: SupplyChainItem{
+				Name:              "foo",
+				ExpectedMaterials: [][]string{{"DISALLOW", "*"}},
+				ExpectedProducts:  [][]string{{"ALLOW", "*"}},
+			},
+		}},
+	}
+
+	// A validly signed link for step "bar", placed into foo's metadata map:
+	// a cross-step replay that signature verification alone would accept.
+	barLink, err := InTotoRun("bar", "", nil, nil, nil, carol,
+		[]string{"sha256"}, nil, nil, testOSisWindows(), false, false)
+	if err != nil {
+		t.Fatalf("failed to create bar link: %s", err)
+	}
+	stepsMetadata := map[string]map[string]Metadata{
+		"foo": {carol.KeyID: barLink},
+	}
+
+	_, err = VerifyLinkSignatureThesholds(layout, stepsMetadata,
+		x509.NewCertPool(), x509.NewCertPool())
+	if err == nil || !errors.Is(err, ErrLinkStepMismatch) {
+		t.Fatalf("expected ErrLinkStepMismatch for replayed link, got: %v", err)
+	}
+
+	// A correctly named foo link still passes.
+	fooLink, err := InTotoRun("foo", "", nil, nil, nil, carol,
+		[]string{"sha256"}, nil, nil, testOSisWindows(), false, false)
+	if err != nil {
+		t.Fatalf("failed to create foo link: %s", err)
+	}
+	stepsMetadata = map[string]map[string]Metadata{
+		"foo": {carol.KeyID: fooLink},
+	}
+	verified, err := VerifyLinkSignatureThesholds(layout, stepsMetadata,
+		x509.NewCertPool(), x509.NewCertPool())
+	if err != nil {
+		t.Fatalf("valid foo link was rejected: %s", err)
+	}
+	if len(verified["foo"]) != 1 {
+		t.Fatalf("expected one verified foo link, got %v", verified)
+	}
+}
+
+// TestVerifyLinkStepBinding covers the binding helper directly.
+func TestVerifyLinkStepBinding(t *testing.T) {
+	step := Step{SupplyChainItem: SupplyChainItem{Name: "foo"}}
+
+	validLink := &Metablock{Signed: Link{Type: "link", Name: "foo"}}
+	if err := verifyLinkStepBinding(validLink, step); err != nil {
+		t.Errorf("valid same-step link was rejected: %s", err)
+	}
+
+	replayedLink := &Metablock{Signed: Link{Type: "link", Name: "bar"}}
+	if err := verifyLinkStepBinding(replayedLink, step); !errors.Is(err, ErrLinkStepMismatch) {
+		t.Errorf("expected ErrLinkStepMismatch for replayed link, got: %v", err)
+	}
+
+	unnamedLink := &Metablock{Signed: Link{Type: "link", Name: ""}}
+	err := verifyLinkStepBinding(unnamedLink, step)
+	if !errors.Is(err, ErrLinkStepMismatch) || !errors.Is(err, ErrLinkNameEmpty) {
+		t.Errorf("expected wrapped ErrLinkNameEmpty, got: %v", err)
+	}
+
+	nestedLayout := &Metablock{Signed: Layout{Type: "layout"}}
+	if err := verifyLinkStepBinding(nestedLayout, step); !errors.Is(err, ErrLinkStepMismatch) {
+		t.Errorf("expected ErrLinkStepMismatch for non-link payload, got: %v", err)
+	}
+}
+
+// TestValidateLinkRejectsEmptyName ensures parse-time validation refuses
+// links without a step name.
+func TestValidateLinkRejectsEmptyName(t *testing.T) {
+	link := Link{
+		Type:        "link",
+		Name:        "",
+		Materials:   map[string]HashObj{},
+		Products:    map[string]HashObj{},
+		ByProducts:  map[string]interface{}{},
+		Command:     []string{},
+		Environment: map[string]interface{}{},
+	}
+	if err := validateLink(link); !errors.Is(err, ErrLinkNameEmpty) {
+		t.Errorf("expected ErrLinkNameEmpty, got: %v", err)
+	}
 }

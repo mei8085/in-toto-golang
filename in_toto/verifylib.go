@@ -24,6 +24,45 @@ var ErrInspectionRunDirIsSymlink = errors.New("runDir is a symlink. This is a se
 
 var ErrNotLayout = errors.New("verification workflow passed a non-layout")
 
+// ErrLinkStepMismatch gets returned when a signed link's payload claims a
+// different step name than the layout step it is associated with. This
+// prevents a link validly signed for one step from being replayed as
+// evidence for a different step.
+var ErrLinkStepMismatch = errors.New("link payload name does not match the layout step")
+
+// ErrDuplicateLinkSigner gets returned when more than one link file for the
+// same step carries a signature from the same functionary key. Such an alias
+// collision would otherwise silently hide one of the links and distort
+// threshold accounting.
+var ErrDuplicateLinkSigner = errors.New("multiple link files with the same signing key for step")
+
+/*
+verifyLinkStepBinding ensures that the passed signed link metadata is firmly
+bound to the passed layout step. It asserts that the payload is a link, that
+its signed name is not empty and that it equals the step's name. Because the
+name is part of the signed payload, a mismatch indicates that the link was
+produced for a different step and must be rejected, e.g. to prevent cross
+step replay or re-binding of a payload to another step.
+*/
+func verifyLinkStepBinding(linkEnv Metadata, step Step) error {
+	link, ok := linkEnv.GetPayload().(Link)
+	if !ok {
+		return fmt.Errorf("%w: metadata for step '%s' is not a link",
+			ErrLinkStepMismatch, step.Name)
+	}
+
+	if link.Name == "" {
+		return fmt.Errorf("%w: %w", ErrLinkStepMismatch, ErrLinkNameEmpty)
+	}
+
+	if link.Name != step.Name {
+		return fmt.Errorf("%w: link '%s' cannot be used for step '%s'",
+			ErrLinkStepMismatch, link.Name, step.Name)
+	}
+
+	return nil
+}
+
 /*
 RunInspections iteratively executes the command in the Run field of all
 inspections of the passed layout, creating unsigned link metadata that records
@@ -398,6 +437,19 @@ func ReduceStepsMetadata(layout Layout,
 				"', no link metadata found.")
 		}
 
+		// Defense in depth: every signed link associated with this step must
+		// still be bound to it. A payload re-bound to a different step name
+		// after loading must never be reduced into the step's evidence.
+		// Sublayouts are nested layouts without a link name and are exempt.
+		for _, linkEnv := range linksPerStep {
+			if _, isLayout := linkEnv.GetPayload().(Layout); isLayout {
+				continue
+			}
+			if err := verifyLinkStepBinding(linkEnv, step); err != nil {
+				return nil, fmt.Errorf("step '%s': %w", step.Name, err)
+			}
+		}
+
 		// Get the first link (could be any link) for the current step, which will
 		// serve as reference link for below comparisons
 		var referenceKeyID string
@@ -562,6 +614,18 @@ func VerifyLinkSignatureThesholds(layout Layout,
 		// below.
 		isAuthorizedSignature := false
 		for signerKeyID, linkEnv := range linksPerStep {
+			// Sublayouts carry a nested layout instead of a link and are
+			// verified recursively by VerifySublayouts. The link name
+			// binding only applies to link payloads.
+			if _, isLayout := linkEnv.GetPayload().(Layout); !isLayout {
+				// Reject links whose signed payload is not bound to this step,
+				// e.g. unnamed links, links replayed from another step or links
+				// whose payload was re-bound to a different step name.
+				if err := verifyLinkStepBinding(linkEnv, step); err != nil {
+					return nil, fmt.Errorf("step '%s': %w", step.Name, err)
+				}
+			}
+
 			for _, authorizedKeyID := range step.PubKeys {
 				if signerKeyID == authorizedKeyID {
 					if verifierKey, ok := layout.Keys[authorizedKeyID]; ok {
@@ -652,6 +716,10 @@ func LoadLinksForLayout(layout Layout, linkDir string) (map[string]map[string]Me
 
 	for _, step := range layout.Steps {
 		linksPerStep := make(map[string]Metadata)
+		// Keep track of the file a signer key was first seen in, so that an
+		// alias collision (two link files signed by the same functionary) can
+		// be reported deterministically instead of silently overwriting a link.
+		signerKeySources := make(map[string]string)
 		// Since we can verify against certificates belonging to a CA, we need to
 		// load any possible links
 		linkFiles, err := filepath.Glob(path.Join(linkDir, fmt.Sprintf(LinkGlobFormat, step.Name)))
@@ -665,14 +733,59 @@ func LoadLinksForLayout(layout Layout, linkDir string) (map[string]map[string]Me
 				continue
 			}
 
+			// A link file may carry a sublayout instead of a link. Sublayouts
+			// are resolved recursively in VerifySublayouts and do not carry a
+			// link name, hence they are exempt from the link name binding.
+			if _, ok := linkEnv.GetPayload().(Layout); ok {
+				for _, sig := range linkEnv.Sigs() {
+					signerShortKeyID := strings.TrimSuffix(
+						strings.TrimPrefix(filepath.Base(linkPath), step.Name+"."),
+						".link")
+					if strings.HasPrefix(sig.KeyID, signerShortKeyID) {
+						if existingPath, exists := signerKeySources[sig.KeyID]; exists {
+							return nil, fmt.Errorf("%w '%s': signer key '%s' in '%s' and '%s'",
+								ErrDuplicateLinkSigner, step.Name, sig.KeyID,
+								existingPath, linkPath)
+						}
+						signerKeySources[sig.KeyID] = linkPath
+						linksPerStep[sig.KeyID] = linkEnv
+						break
+					}
+				}
+				continue
+			}
+
+			// Firmly bind the signed link payload to the layout step. The
+			// signed name must be present and equal to both the step name and
+			// the name encoded in the link file name. This rejects unnamed
+			// links as well as cross-step replays and re-bound payloads.
+			if err := verifyLinkStepBinding(linkEnv, step); err != nil {
+				return nil, fmt.Errorf("'%s': %w", linkPath, err)
+			}
+
 			// To get the full key from the metadata's signatures, we have to check
 			// for one with the same short id...
 			signerShortKeyID := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(linkPath), step.Name+"."), ".link")
+			// Track signer keys matched within this single file, so that a link
+			// carrying two signatures from the same functionary key is reported
+			// as an alias collision rather than silently deduplicated.
+			matchedInFile := make(map[string]bool)
 			for _, sig := range linkEnv.Sigs() {
-				if strings.HasPrefix(sig.KeyID, signerShortKeyID) {
-					linksPerStep[sig.KeyID] = linkEnv
-					break
+				if !strings.HasPrefix(sig.KeyID, signerShortKeyID) {
+					continue
 				}
+				if matchedInFile[sig.KeyID] {
+					return nil, fmt.Errorf("%w '%s': signer key '%s' appears more than once in '%s'",
+						ErrDuplicateLinkSigner, step.Name, sig.KeyID, linkPath)
+				}
+				matchedInFile[sig.KeyID] = true
+				if existingPath, exists := signerKeySources[sig.KeyID]; exists {
+					return nil, fmt.Errorf("%w '%s': signer key '%s' in '%s' and '%s'",
+						ErrDuplicateLinkSigner, step.Name, sig.KeyID,
+						existingPath, linkPath)
+				}
+				signerKeySources[sig.KeyID] = linkPath
+				linksPerStep[sig.KeyID] = linkEnv
 			}
 		}
 

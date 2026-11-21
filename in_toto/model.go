@@ -372,6 +372,10 @@ func validateArtifacts(artifacts map[string]HashObj) error {
 	return nil
 }
 
+// ErrLinkNameEmpty will be thrown if a link's signed payload does not carry
+// the name of the step it provides evidence for.
+var ErrLinkNameEmpty = errors.New("link name cannot be empty")
+
 /*
 validateLink is a function used to ensure that a passed item of type Link
 matches the necessary format.
@@ -380,6 +384,13 @@ func validateLink(link Link) error {
 	if link.Type != "link" {
 		return fmt.Errorf("invalid type for link '%s': should be 'link'",
 			link.Name)
+	}
+
+	// The signed name binds the payload to the supply chain step it provides
+	// evidence for. An unnamed link cannot be associated with any step and
+	// must be rejected.
+	if link.Name == "" {
+		return ErrLinkNameEmpty
 	}
 
 	if err := validateArtifacts(link.Materials); err != nil {
