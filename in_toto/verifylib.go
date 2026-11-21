@@ -369,11 +369,15 @@ func VerifyArtifacts(items []interface{},
 
 /*
 ReduceStepsMetadata merges for each step of the passed Layout all the passed
-per-functionary links into a single link, asserting that the reported Materials
-and Products are equal across links for a given step.  This function may be
-used at a time during the overall verification, where link threshold's have
-been verified and subsequent verification only needs one exemplary link per
-step.  The function returns a map with one Metablock (link) per step:
+per-functionary links into a single link.  The links of each step are grouped
+by subject (functionary key ID), artifact (materials and products) and step,
+and a group only forms a trusted conclusion if at least Threshold distinct
+functionaries agree on the same artifacts (see
+VerifyStepThresholdConsensus).  Duplicate links from the same functionary are
+collapsed and never counted as independent attestations.  This function may
+be used at a time during the overall verification, where link threshold's
+have been verified and subsequent verification only needs one exemplary link
+per step.  The function returns a map with one Metablock (link) per step:
 
 	{
 		<step name> : Metablock,
@@ -381,9 +385,10 @@ step.  The function returns a map with one Metablock (link) per step:
 		...
 	}
 
-If links corresponding to the same step report different Materials or different
-Products, the first return value is an empty Metablock map and the second
-return value is the error.
+If the links of a step do not reach a threshold consensus, e.g. because
+distinct functionaries report contradictory Materials or Products and no
+artifact view gathers enough support, the first return value is an empty
+Metablock map and the second return value is the error.
 */
 func ReduceStepsMetadata(layout Layout,
 	stepsMetadata map[string]map[string]Metadata) (map[string]Metadata,
@@ -398,46 +403,18 @@ func ReduceStepsMetadata(layout Layout,
 				"', no link metadata found.")
 		}
 
-		// Get the first link (could be any link) for the current step, which will
-		// serve as reference link for below comparisons
-		var referenceKeyID string
-		var referenceLinkEnv Metadata
-		for keyID, linkEnv := range linksPerStep {
-			referenceLinkEnv = linkEnv
-			referenceKeyID = keyID
-			break
+		// Group the links of the step by subject, artifact and step, and
+		// check whether one artifact view is attested by enough (>=
+		// threshold) distinct functionaries to form a trusted conclusion
+		consensus := VerifyStepThresholdConsensusFromMap(step, linksPerStep)
+		if !consensus.Trusted() {
+			return nil, fmt.Errorf("could not reduce metadata for step '%s':"+
+				" %s", step.Name, consensus.Summary())
 		}
 
-		// Only one link, nothing to reduce, take the reference link
-		if len(linksPerStep) == 1 {
-			stepsMetadataReduced[step.Name] = referenceLinkEnv
-
-			// Multiple links, reduce but first check
-		} else {
-			// Artifact maps must be equal for each type among all links
-			// TODO: What should we do if there are more links, than the
-			// threshold requires, but not all of them are equal? Right now we would
-			// also error.
-			for keyID, linkEnv := range linksPerStep {
-				link, ok := linkEnv.GetPayload().(Link)
-				if !ok {
-					return nil, fmt.Errorf("invalid metadata")
-				}
-				refLink, ok := referenceLinkEnv.GetPayload().(Link)
-				if !ok {
-					return nil, fmt.Errorf("invalid metadata")
-				}
-				if !reflect.DeepEqual(link.Materials, refLink.Materials) ||
-					!reflect.DeepEqual(link.Products, refLink.Products) {
-					return nil, fmt.Errorf("link '%s' and '%s' have different"+
-						" artifacts",
-						fmt.Sprintf(LinkNameFormat, step.Name, referenceKeyID),
-						fmt.Sprintf(LinkNameFormat, step.Name, keyID))
-				}
-			}
-			// We haven't errored out, so we can reduce (i.e take the reference link)
-			stepsMetadataReduced[step.Name] = referenceLinkEnv
-		}
+		// The trusted group reached the threshold, so we can reduce to its
+		// reference link
+		stepsMetadataReduced[step.Name] = consensus.TrustedGroup.ReferenceLink
 	}
 	return stepsMetadataReduced, nil
 }
@@ -559,9 +536,11 @@ func VerifyLinkSignatureThesholds(layout Layout,
 		// For each link corresponding to a step, check that the signer key was
 		// authorized, the layout contains a verification key and the signature
 		// verification passes.  Only good links are stored, to verify thresholds
-		// below.
-		isAuthorizedSignature := false
+		// below.  The authorization flag must be reset for every link, so that
+		// links not signed by an authorized key still fall back to the
+		// certificate constraint check below.
 		for signerKeyID, linkEnv := range linksPerStep {
+			isAuthorizedSignature := false
 			for _, authorizedKeyID := range step.PubKeys {
 				if signerKeyID == authorizedKeyID {
 					if verifierKey, ok := layout.Keys[authorizedKeyID]; ok {
